@@ -420,3 +420,110 @@ feed still returns the older (>30 min) events after the fix. The per-friend dedu
 exactly once. Full suite is unchanged at 11 passed; the only failures remain the two
 `test_playlists.py` cases for the separate Issue #5. (There is no dedicated feed test
 in the suite, so I verified this bug via the probe scenarios above.)
+
+---
+
+## Root Cause Analysis — Bug 3: "The same song keeps showing up twice in search"
+
+**Issue #3 — The same song keeps showing up twice in search** (`search_service.py`)
+
+### How I reproduced it
+The feature is `GET /songs/search?q=<query>` → `search_songs`
+([services/search_service.py:11](services/search_service.py#L11)). I seeded the app
+(`python seed_data.py`, which creates songs with 0, 1, and 3+ tags) and searched for
+the 3-tag song "Crown Heights Anthem" via `q="Crown"`.
+
+This bug only appears under **two simultaneous conditions**:
+1. **Data condition:** the matching song must have **2+ tags**. 0-tag and 1-tag songs
+   produce ≤1 joined row and can never duplicate — only multi-tag songs fan out.
+2. **ORM condition:** the duplication is **latent** in this codebase. The service used
+   the *legacy* `db.session.query(Song).all()` API, which on SQLAlchemy 2.0.51 silently
+   uniquifies entities by identity, collapsing the fanned-out rows back to one. So
+   through `GET /songs/search` the duplicate did **not** surface here, which is why
+   `tests/test_search.py::test_search_no_duplicates_multi_tag_song` passes as-is.
+
+To prove the defect was real rather than imagined, I measured the query *underneath*
+the masking. For `q="Crown"` (the single 3-tag song):
+- raw join selecting `Song.id` → **3 rows**
+- `select(Song).scalars().all()` (the 2.0-style API, no `.unique()`) → **3 Song objects**
+- `db.session.query(Song).all()` (what the service used) → **1 object** (masked)
+
+So the fan-out genuinely existed; it was one driver/ORM detail away from being visible.
+
+### How I found the root cause
+The README maps the symptom to `search_service.py`. I read the single query in
+`search_songs` and the model layer it touches. The query joins `song_tags`:
+
+```python
+db.session.query(Song)
+  .outerjoin(song_tags, Song.id == song_tags.c.song_id)
+  .filter(or_(Song.title.ilike(...), Song.artist.ilike(...)))
+```
+
+The moment of confidence came from asking *what the join is actually for.* The
+`filter` only references `Song.title` and `Song.artist` — never any `song_tags` or
+`Tag` column. And `to_dict()` ([models.py:92](models.py#L92)) builds the `tags` list
+from `self.tags`, a `lazy="subquery"` relationship ([models.py:90](models.py#L90))
+that issues its own query — it does not read from this join at all. So the join
+contributes **nothing** to either the filter or the output; its only effect is to emit
+one result row per `(song, tag)` pair. That pinpointed the exact cause: a row fan-out
+from an unnecessary join, with no de-duplication.
+
+### The root cause
+`song_tags` is a many-to-many association table — one row per (song, tag) pair. The
+query `outerjoin`ed it but never used any of its columns for filtering or selection.
+Because a SQL join over a one-to-many produces the cartesian expansion, a song with N
+tags yielded **N duplicate result rows** (the 3-tag song → 3 rows), and the query
+applied no `DISTINCT`. In other words, the bug is a join that should never have been
+in the query: it can only multiply rows, never change which songs match. (The reason
+end users could still hit it despite the legacy-`Query` masking is that the underlying
+result set was genuinely duplicated — any move to the modern `select()` API, or a
+backend/path that doesn't uniquify by identity, exposes it immediately.)
+
+### My fix and side-effect check
+The targeted fix removes the root cause at its source — the unnecessary join — rather
+than masking the symptom with `.distinct()` on a join that shouldn't exist
+([services/search_service.py:25](services/search_service.py#L25)):
+
+```python
+results = (
+    db.session.query(Song)
+    .filter(
+        db.or_(
+            Song.title.ilike(f"%{query}%"),
+            Song.artist.ilike(f"%{query}%"),
+        )
+    )
+    .all()
+)
+```
+
+I also dropped the now-unused `song_tags` import
+([services/search_service.py:8](services/search_service.py#L8)). That is the only
+other change, and it is necessary purely to avoid leaving a dead import behind — no
+logic depends on it. With the join gone the SQL returns one row per matching song by
+construction, so correctness no longer relies on the ORM happening to uniquify.
+
+I verified the fan-out is fixed *below* the masking layer: the raw query for `q="Crown"`
+now returns **1 row** (was 3).
+
+**Coverage check across the data conditions that gate this bug:**
+
+| Song bucket | Query | Result count | Duplicates |
+|---|---|---|---|
+| 3 tags ("Crown Heights Anthem") | `Crown` | 1 | none ✅ |
+| 3 tags ("Harlem Renaissance") | `Harlem` | 1 | none ✅ |
+| 1 tag ("Block Party") | `Block Party` | 1 | none ✅ |
+| 0 tags ("Midnight Drive") | `Midnight Drive` | 1 | none ✅ |
+| broad match | `a` (13 songs) | 13 | none ✅ |
+| no match | `zzz_no_match_zzz` | 0 | — ✅ |
+
+**Related functionality checked:** the worry with removing a join is losing data or
+dropping rows. (1) **Tags still appear** — `to_dict()` sources them from the
+`lazy="subquery"` relationship, independent of the query; I confirmed "Crown Heights
+Anthem" still returns all 3 tags `['rap', 'hip-hop', 'boom bap']`. (2) **No songs
+dropped** — it was an *outer* join, so it never filtered anything out; the result set
+is the same minus the duplicate rows (0-tag and 1-tag songs still match and return).
+(3) **Search semantics unchanged** — the `title`/`artist` ilike filter is byte-for-byte
+the same. The existing `tests/test_search.py` still passes (5/5); the only suite
+failures remain the two `test_playlists.py` cases for the separate Issue #5.
