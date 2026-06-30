@@ -337,3 +337,86 @@ and `get_streak` (read-only) don't depend on weekday, so they're unaffected. Ful
 suite: `tests/test_streaks.py` now passes entirely (including the previously failing
 Sunday test); the only remaining failures are the two `test_playlists.py` cases, which
 are the separate, unaddressed Issue #5.
+
+---
+
+## Root Cause Analysis — Bug 2: "Friends Listening Now shows people from yesterday"
+
+**Issue #2 — Friends Listening Now shows people from yesterday** (`feed_service.py`)
+
+### How I reproduced it
+The feature is `GET /feed/<user_id>/listening-now` → `get_friends_listening_now`
+([services/feed_service.py:16](services/feed_service.py#L16)). I exercised it against
+seeded data (`python seed_data.py`) for `nova`.
+
+The default seed *masks* the bug: every one of nova's friends (darius, simone, kenji)
+also has a fresh ~10–20-min-old event, and the function dedupes to the most-recent
+event per friend, so the fresh event always wins and the stale ones never show. So the
+condition needed to actually see it is **a friend whose most-recent listen is between
+~30 minutes and 24 hours ago, with no fresher event to mask it.**
+
+I constructed exactly that: for nova's friend darius I deleted his fresh events and
+inserted a single listen **6 hours ago**, then called `get_friends_listening_now(nova.id)`.
+darius appeared in "Listening NOW" with `age=6:00:00`. **Bug confirmed** — a 6-hour-old
+listen should never count as "now."
+
+### How I found the root cause
+The README maps the symptom to `feed_service.py`. I traced
+[routes/feed.py:9](routes/feed.py#L9) `listening_now()` → `get_friends_listening_now`.
+The query itself is correct — it filters `ListeningEvent.listened_at >= cutoff` and
+orders by most-recent. The only thing that defines "recent" is the module constant
+feeding that cutoff:
+
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+...
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+```
+
+The moment of confidence: the seed file documents the intended contract right next to
+the data it creates — *"Recent events (within the past 30 minutes) — should appear in
+'listening now'"* and *"Older events (1–14 days ago) — should NOT appear in 'listening
+now' after fix."* A 24-hour window is ~48× wider than that intended ~30-minute "now"
+window, which exactly explains why a friend who listened hours ago (but within a day)
+still shows up. Not a suspicious area — the single constant *is* the cutoff, and its
+value is the defect.
+
+### The root cause
+"Listening Now" is supposed to mean *currently/just-now listening* — a window of
+roughly 30 minutes. But `RECENT_THRESHOLD` was set to `timedelta(hours=24)`, so the
+recency filter `listened_at >= now - RECENT_THRESHOLD` admitted **any event from the
+last full day**. Any friend who listened to something earlier today — or even
+yesterday evening, up to 24 hours back — was treated as "listening now." The query
+logic, ordering, and per-friend dedup were all correct; the sole problem was the
+threshold value being far larger than the feature's definition of "now."
+
+### My fix and side-effect check
+One-line, root-cause-targeted change in
+[services/feed_service.py:13](services/feed_service.py#L13) — narrow the window to the
+~30-minute "now" the feature (and the seed contract) intends:
+
+```python
+RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+Nothing else changed — the query, the cutoff computation, and the dedup logic that
+consume the constant were already correct.
+
+**Boundary check (both sides of the 30-minute cutoff):**
+
+| Scenario | Shown in "Listening Now"? | Expected |
+|---|---|---|
+| Friend listened 10–20 min ago (seed) | yes | yes ✅ |
+| Friend listened 29 min ago | yes | yes ✅ |
+| Friend listened 31 min ago | no | no ✅ |
+| Friend listened 6 h ago (bug repro) | no | no ✅ |
+
+**Related functionality checked:** I looked at the other consumer of the same
+data/feature, `get_activity_feed` ([services/feed_service.py:65](services/feed_service.py#L65)).
+By design it is *not* filtered by recency (its docstring says so) and it does **not**
+reference `RECENT_THRESHOLD`, so the change can't affect it — I confirmed the activity
+feed still returns the older (>30 min) events after the fix. The per-friend dedup in
+`listening-now` is unchanged, so friends with a genuinely fresh event still appear
+exactly once. Full suite is unchanged at 11 passed; the only failures remain the two
+`test_playlists.py` cases for the separate Issue #5. (There is no dedicated feed test
+in the suite, so I verified this bug via the probe scenarios above.)
