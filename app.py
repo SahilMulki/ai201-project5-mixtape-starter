@@ -4,7 +4,7 @@ app.py — Mixtape
 Flask application factory and database setup.
 """
 
-from flask import Flask
+from flask import Flask, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import os
 
@@ -36,6 +36,23 @@ def create_app(config=None):
     app.register_blueprint(playlists_bp, url_prefix="/playlists")
     app.register_blueprint(users_bp, url_prefix="/users")
     app.register_blueprint(feed_bp, url_prefix="/feed")
+
+    @app.route("/")
+    def index():
+        return jsonify({
+            "app": "Mixtape",
+            "endpoints": {
+                "songs": {
+                    "search": "GET /songs/search?q=<query>",
+                    "detail": "GET /songs/<song_id>",
+                    "rate": "POST /songs/<song_id>/rate",
+                    "listen": "POST /songs/<song_id>/listen",
+                },
+                "playlists": "GET/POST /playlists",
+                "users": "GET/POST /users",
+                "feed": "GET /feed",
+            }
+        })
 
     with app.app_context():
         db.create_all()
